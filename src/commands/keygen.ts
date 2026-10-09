@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises';
+import { chmod, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
@@ -35,6 +35,10 @@ export async function runKeygen(flags: IKeygenFlags, context: ICommandContext): 
 
   const out = path.resolve(flags.out ?? DEFAULT_KEY_FILE);
   await writeFile(out, `${hex}\n`, { flag: flags.force ? 'w' : 'wx', mode: 0o600 });
+  // `mode` above only applies when the file is created, so a `--force` overwrite
+  // would leave a private key at whatever permissions the old file had while the
+  // summary below claims 0600.
+  await chmod(out, 0o600);
 
   const publicKey = HexConverter.encode(new SigningService(privateKey).publicKey);
   context.stdout.write(context.json ? toJsonLine(keygenJson(out, publicKey)) : `${keygenText(out, publicKey)}\n`);

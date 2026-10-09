@@ -1,4 +1,4 @@
-import { readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { runCli } from '../support/cli.js';
@@ -127,6 +127,61 @@ describe('unicity-timestamp (offline)', () => {
       expect(piped.code).toBe(0);
       expect(piped.stdout.trim()).toMatch(/^[0-9a-f]{64}$/);
       expect(piped.stderr).toEqual('');
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'restores mode 0600 when --force overwrites a key file with looser permissions',
+    async () => {
+      // `writeFile`'s mode applies only when the file is created, so the forced
+      // overwrite path has to narrow the permissions itself or leave a private
+      // key readable by everyone while reporting 0600.
+      const keyFile = path.join(cwd, 'loose.key');
+      await writeFile(keyFile, 'placeholder\n', { mode: 0o600 });
+      await chmod(keyFile, 0o644);
+      expect((await stat(keyFile)).mode & 0o777).toBe(0o644);
+
+      const forced = await runCli(['keygen', '--out', keyFile, '--force'], { cwd });
+      expect(forced.code).toBe(0);
+      expect(forced.stdout).toContain('mode 0600');
+      expect((await stat(keyFile)).mode & 0o777).toBe(0o600);
+      expect((await readFile(keyFile, 'utf8')).trim()).toMatch(/^[0-9a-f]{64}$/);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'ignores a trust base named by a .env found in the working directory',
+    async () => {
+      // A token plus a .env naming the trust base that validates it would
+      // otherwise be a complete forgery kit, and the verdict would not say so.
+      const directory = await tempDir('timestamp-cli-dotenv-');
+      const mainnetTrustBase = path.resolve('src/trust-bases/bft-trustbase.mainnet.json');
+      const fixture = path.resolve('tests/fixtures/testnet2-anonymous.cbor');
+      await writeFile(path.join(directory, '.env'), `UNICITY_TRUST_BASE=${mainnetTrustBase}\n`);
+
+      const ignored = await runCli(['verify', fixture, '--json'], { cwd: directory });
+      expect(ignored.code).toBe(0);
+      expect(JSON.parse(ignored.stdout)).toMatchObject({
+        status: 'OK',
+        trustBase: { bundledNetwork: 'testnet2', path: null, source: 'bundled' },
+      });
+      expect(ignored.stderr).toContain('ignored UNICITY_TRUST_BASE');
+
+      // The same override, asked for explicitly, still applies — and the verdict
+      // names the file rather than wearing the bundled pin's name.
+      const explicit = await runCli(['verify', fixture, '--trust-base', mainnetTrustBase], { cwd: directory });
+      expect(explicit.code).toBe(1);
+      expect(explicit.stdout).toContain(mainnetTrustBase);
+      expect(explicit.stdout).toContain('override, not the bundled pin');
+
+      const viaDotenv = await runCli(['--dotenv', path.join(directory, '.env'), 'verify', fixture, '--json'], {
+        cwd: directory,
+      });
+      expect(JSON.parse(viaDotenv.stdout)).toMatchObject({
+        trustBase: { bundledNetwork: null, path: mainnetTrustBase, source: 'file' },
+      });
     },
     TIMEOUT,
   );
