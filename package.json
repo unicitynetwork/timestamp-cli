@@ -1,0 +1,70 @@
+{
+  "name": "@unicitylabs/timestamp-cli",
+  "version": "0.1.0",
+  "description": "Timestamp a SHA-256 hash on the Unicity Network and verify the resulting token offline",
+  "type": "module",
+  "bin": {
+    "unicity-timestamp": "lib/cli.js"
+  },
+  "exports": {
+    ".": "./lib/lib/index.js"
+  },
+  "files": [
+    "lib/**/*",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "build:check": "tsc --noEmit",
+    "lint": "eslint \"src/**/*\" \"tests/**/*\"",
+    "lint:fix": "eslint \"src/**/*\" \"tests/**/*\" --fix",
+    "prepare": "npm run build",
+    "pretest": "npm run build",
+    "test": "jest",
+    "test:e2e": "jest --testPathPatterns=tests/e2e",
+    "test:unit": "jest --testPathPatterns=tests/unit",
+    "trust-bases:update": "node scripts/update-trust-bases.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unicitynetwork/timestamp-cli.git"
+  },
+  "keywords": [
+    "unicity",
+    "timestamp",
+    "timestamping",
+    "proof-of-existence",
+    "cli"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/unicitynetwork/timestamp-cli#readme",
+  "bugs": {
+    "url": "https://github.com/unicitynetwork/timestamp-cli/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@unicitylabs/state-transition-sdk": "3.0.1",
+    "commander": "15.0.0"
+  },
+  "devDependencies": {
+    "@babel/core": "8.0.1",
+    "@babel/preset-env": "8.0.2",
+    "@babel/preset-typescript": "8.0.1",
+    "@eslint/js": "9.39.5",
+    "@types/jest": "30.0.0",
+    "@types/node": "22.13.14",
+    "babel-jest": "30.4.1",
+    "eslint": "9.39.5",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-import": "2.32.0",
+    "eslint-plugin-prettier": "5.5.6",
+    "globals": "17.7.0",
+    "jest": "30.4.2",
+    "prettier": "3.9.6",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0"
+  }
+}

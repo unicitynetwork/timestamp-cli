@@ -1,0 +1,297 @@
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { access, readFile } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+
+import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
+import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
+import { HexConverter } from '@unicitylabs/state-transition-sdk/lib/util/HexConverter.js';
+
+import { usageError } from './errors.js';
+import {
+  bundledTrustBase,
+  INetworkSelection,
+  isNetworkName,
+  ITimestampNetwork,
+  loadTrustBase,
+  NETWORK_NAMES,
+  NetworkName,
+  resolveNetwork,
+} from './lib/networks.js';
+import { DEFAULT_TIMEOUT_MS } from './lib/TimestampClient.js';
+
+/** 32 bytes as hex, any case, optional 0x prefix. Shared by digests and private keys. */
+const HEX_32_BYTES = /^(0x)?[0-9a-fA-F]{64}$/;
+/** Hex characters of the digest used in the default output file name; 64 bits is plenty for one directory. */
+const OUTPUT_NAME_DIGEST_CHARS = 16;
+/** Read size for hashing files; large chunks cut the streaming overhead on big inputs. */
+const HASH_CHUNK_BYTES = 4 << 20;
+
+export interface INetworkFlags {
+  readonly gateway?: string;
+  readonly network?: string;
+  readonly trustBase?: string;
+}
+
+export interface IStampFlags extends INetworkFlags {
+  readonly allowInsecure?: boolean;
+  readonly anonymous?: boolean;
+  readonly apiKey?: string;
+  readonly file?: string;
+  readonly force?: boolean;
+  readonly keyFile?: string;
+  readonly out?: string;
+  readonly sign?: boolean;
+  readonly timeout?: string;
+}
+
+export interface IStampConfig {
+  readonly allowInsecure: boolean;
+  readonly apiKey: string;
+  readonly digest: Uint8Array;
+  readonly force: boolean;
+  readonly network: ITimestampNetwork;
+  readonly out: string;
+  readonly signer?: SigningService;
+  readonly timeoutMs: number;
+}
+
+/**
+ * Load `.env` with Node's built-in loader. Variables already in the environment win; Node guarantees that.
+ *
+ * @param {string} [envFile] Explicit file; when given it must exist.
+ * @throws {CliError} If an explicit env file is missing.
+ */
+export function loadEnvironment(envFile?: string): void {
+  try {
+    process.loadEnvFile(envFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+    if (envFile !== undefined) {
+      throw usageError(`Env file not found: ${envFile}`, { cause: error });
+    }
+  }
+}
+
+function parseHex32(input: string, message: string): Uint8Array {
+  const trimmed = input.trim();
+  if (!HEX_32_BYTES.test(trimmed)) {
+    throw usageError(message);
+  }
+  return HexConverter.decode(trimmed);
+}
+
+/**
+ * @param {string} input 64 hex characters, any case, optional 0x prefix.
+ * @returns {Uint8Array} 32-byte digest.
+ * @throws {CliError} If the input is not a SHA-256 digest.
+ */
+export function parseDigest(input: string): Uint8Array {
+  return parseHex32(input, `Expected a SHA-256 digest of 64 hex characters, got '${input}'.`);
+}
+
+/**
+ * @param {string} input 64 hex characters, any case, optional 0x prefix, surrounding whitespace allowed.
+ * @returns {Uint8Array} 32-byte secp256k1 private key.
+ * @throws {CliError} If the input is not a key.
+ */
+export function parsePrivateKey(input: string): Uint8Array {
+  return parseHex32(input, 'Private key must be 64 hex characters.');
+}
+
+/**
+ * @param {string} value Candidate network name.
+ * @returns {NetworkName} The name, narrowed.
+ * @throws {CliError} If it is not a bundled network.
+ */
+export function parseNetworkName(value: string): NetworkName {
+  if (!isNetworkName(value)) {
+    throw usageError(`Unknown network '${value}'; expected one of ${NETWORK_NAMES.join(', ')}.`);
+  }
+  return value;
+}
+
+/**
+ * SHA-256 of a file, streamed. The file never leaves the machine.
+ *
+ * @param {string} path File to hash.
+ * @returns {Promise<Uint8Array>} 32-byte digest.
+ */
+export async function hashFile(path: string): Promise<Uint8Array> {
+  const hash = createHash('sha256');
+  await pipeline(createReadStream(path, { highWaterMark: HASH_CHUNK_BYTES }), hash);
+  return new Uint8Array(hash.digest());
+}
+
+/**
+ * Resolve a digest from at most one of a digest string and a file to hash.
+ *
+ * @param {string} [digest] Digest as hex.
+ * @param {string} [file] File to hash instead.
+ * @param {string} digestFlag How the digest option is named in the error for passing both.
+ * @returns {Promise<Uint8Array|undefined>} 32-byte digest, or undefined when neither was given.
+ * @throws {CliError} If both are given or the digest is malformed.
+ */
+export async function resolveDigest(
+  digest?: string,
+  file?: string,
+  digestFlag = 'a digest',
+): Promise<Uint8Array | undefined> {
+  if (digest !== undefined && file !== undefined) {
+    throw usageError(`Pass either ${digestFlag} or --file, not both.`);
+  }
+  if (digest !== undefined) {
+    return parseDigest(digest);
+  }
+  return file === undefined ? undefined : await hashFile(file);
+}
+
+/**
+ * Network selection for stamping: flags, then environment, then the mainnet default.
+ *
+ * @param {INetworkFlags} flags Command-line flags.
+ * @param {NodeJS.ProcessEnv} env Environment.
+ * @returns {INetworkSelection} Validated selection.
+ * @throws {CliError} On an unknown network name or an invalid gateway URL.
+ */
+export function resolveNetworkSelection(flags: INetworkFlags, env: NodeJS.ProcessEnv = process.env): INetworkSelection {
+  const gatewayUrl = flags.gateway ?? env.UNICITY_GATEWAY_URL;
+  if (gatewayUrl !== undefined) {
+    try {
+      new URL(gatewayUrl);
+    } catch (error) {
+      throw usageError(`Invalid gateway URL '${gatewayUrl}'.`, { cause: error });
+    }
+  }
+  return {
+    gatewayUrl,
+    network: parseNetworkName(flags.network ?? env.UNICITY_NETWORK ?? 'mainnet'),
+    trustBasePath: flags.trustBase ?? env.UNICITY_TRUST_BASE,
+  };
+}
+
+/**
+ * Trust base explicitly chosen for verification: a file, or a named network.
+ * `UNICITY_NETWORK` is not consulted; it configures stamping, and a token says
+ * which network it belongs to.
+ *
+ * @param {INetworkFlags} flags Command-line flags.
+ * @param {NodeJS.ProcessEnv} env Environment.
+ * @returns {Promise<RootTrustBase|undefined>} The override, or undefined to derive it from the token.
+ * @throws {CliError} On an unknown network name.
+ */
+export async function resolveTrustBaseOverride(
+  flags: INetworkFlags,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<RootTrustBase | undefined> {
+  const trustBasePath = flags.trustBase ?? env.UNICITY_TRUST_BASE;
+  if (trustBasePath !== undefined) {
+    return await loadTrustBase(trustBasePath);
+  }
+  return flags.network === undefined ? undefined : bundledTrustBase(parseNetworkName(flags.network));
+}
+
+/**
+ * @param {string} [value] Flag or environment value.
+ * @returns {number} Timeout in milliseconds.
+ * @throws {CliError} If the value is not a positive integer.
+ */
+export function parseTimeoutSeconds(value?: string): number {
+  if (value === undefined) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds <= 0) {
+    throw usageError(`--timeout must be a positive integer number of seconds, got '${value}'.`);
+  }
+  return seconds * 1000;
+}
+
+async function resolveSigner(flags: IStampFlags, env: NodeJS.ProcessEnv): Promise<SigningService | undefined> {
+  if (flags.anonymous && flags.sign) {
+    throw usageError('--anonymous and --sign contradict each other.');
+  }
+  if (flags.anonymous) {
+    return undefined;
+  }
+  let keyHex: string | undefined;
+  if (flags.keyFile !== undefined) {
+    try {
+      keyHex = await readFile(flags.keyFile, 'utf8');
+    } catch (error) {
+      throw usageError(`Cannot read key file ${flags.keyFile}.`, { cause: error });
+    }
+  } else {
+    keyHex = env.UNICITY_PRIVATE_KEY;
+  }
+  if (keyHex === undefined || keyHex.trim() === '') {
+    if (flags.sign) {
+      throw usageError('--sign requires a key: pass --key-file or set UNICITY_PRIVATE_KEY.');
+    }
+    return undefined;
+  }
+  return new SigningService(parsePrivateKey(keyHex));
+}
+
+/** Fail before any network contact when the output file already exists. The write itself uses `wx` as well. */
+async function assertWritable(out: string, force: boolean): Promise<void> {
+  if (out === '-' || force) {
+    return;
+  }
+  try {
+    await access(out);
+  } catch {
+    return;
+  }
+  throw usageError(`Refusing to overwrite ${out}; pass --force or another --out.`);
+}
+
+/**
+ * Everything `stamp` needs, validated before any network contact. Cheap checks
+ * run first so a misconfiguration is reported before a large file is hashed.
+ *
+ * @param {string} [digestArgument] Positional digest.
+ * @param {IStampFlags} flags Command-line flags.
+ * @param {NodeJS.ProcessEnv} env Environment, after `.env` was loaded.
+ * @returns {Promise<IStampConfig>} Resolved configuration.
+ * @throws {CliError} On any missing or invalid setting.
+ */
+export async function resolveStampConfig(
+  digestArgument: string | undefined,
+  flags: IStampFlags,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<IStampConfig> {
+  if (digestArgument === undefined && flags.file === undefined) {
+    throw usageError('Pass a SHA-256 digest or --file <path>.');
+  }
+
+  const apiKey = (flags.apiKey ?? env.UNICITY_API_KEY)?.trim();
+  if (!apiKey) {
+    throw usageError('No API key. Set UNICITY_API_KEY in the environment or .env, or pass --api-key.');
+  }
+
+  const network = await resolveNetwork(resolveNetworkSelection(flags, env));
+  const allowInsecure = flags.allowInsecure ?? false;
+  if (new URL(network.gatewayUrl).protocol !== 'https:' && !allowInsecure) {
+    throw usageError(
+      'The API key must not be sent over plain HTTP. Use an https gateway, or pass --allow-insecure for a local aggregator.',
+    );
+  }
+
+  const signer = await resolveSigner(flags, env);
+  const timeoutMs = parseTimeoutSeconds(flags.timeout ?? env.UNICITY_TIMEOUT);
+  const force = flags.force ?? false;
+  if (flags.out !== undefined) {
+    await assertWritable(flags.out, force);
+  }
+
+  const digest = (await resolveDigest(digestArgument, flags.file)) as Uint8Array;
+  const out = flags.out ?? `token_${HexConverter.encode(digest).slice(0, OUTPUT_NAME_DIGEST_CHARS)}.cbor`;
+  if (flags.out === undefined) {
+    await assertWritable(out, force);
+  }
+
+  return { allowInsecure, apiKey, digest, force, network, out, signer, timeoutMs };
+}

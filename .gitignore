@@ -1,0 +1,10 @@
+.env
+node_modules/
+/lib/
+coverage/
+/*.cbor
+/*.token
+/*.key
+.idea/
+/DESIGN.md
+/CLAUDE.md
