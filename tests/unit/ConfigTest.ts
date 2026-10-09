@@ -61,6 +61,22 @@ describe('parseTimeoutSeconds', () => {
   it.each(['0', '-1', '1.5', 'abc', ''])('rejects %p', (input) => {
     expect(() => parseTimeoutSeconds(input)).toThrow(/positive integer/);
   });
+
+  // AbortSignal.timeout is constructed after the certification request has been
+  // submitted and billed, so a delay Node cannot represent would certify the
+  // digest and then abandon the wait. These have to fail before the network call.
+  it.each(['2147484', '4294967', '99999999', '1000000000'])('rejects %p as too large to wait for', (input) => {
+    expect(() => parseTimeoutSeconds(input)).toThrow(/at most 2147483 seconds/);
+  });
+
+  it('keeps the largest accepted delay inside the range a Node timer can hold', () => {
+    // Beyond this a timer is silently reduced to 1ms rather than refused, so the
+    // bound has to be asserted numerically; nothing throws to catch it.
+    const NODE_TIMEOUT_MAX_MS = 2 ** 31 - 1;
+    expect(parseTimeoutSeconds('2147483')).toBe(2_147_483_000);
+    expect(parseTimeoutSeconds('2147483')).toBeLessThanOrEqual(NODE_TIMEOUT_MAX_MS);
+    expect(parseTimeoutSeconds(undefined)).toBeLessThanOrEqual(NODE_TIMEOUT_MAX_MS);
+  });
 });
 
 describe('hashFile and resolveDigest', () => {
@@ -107,12 +123,25 @@ describe('resolveTrustBaseOverride', () => {
   });
 
   it('honours --network, --trust-base and UNICITY_TRUST_BASE', async () => {
-    expect((await resolveTrustBaseOverride({ network: 'testnet2' }, {}))?.networkId.id).toBe(4);
+    expect((await resolveTrustBaseOverride({ network: 'testnet2' }, {}))?.trustBase.networkId.id).toBe(4);
     const file = path.join(await tempDir(), 'tb.json');
     await writeFile(file, JSON.stringify(NETWORKS.testnet2.trustBaseJson));
-    expect((await resolveTrustBaseOverride({ trustBase: file }, {}))?.networkId.id).toBe(4);
-    expect((await resolveTrustBaseOverride({}, { UNICITY_TRUST_BASE: file }))?.networkId.id).toBe(4);
+    expect((await resolveTrustBaseOverride({ trustBase: file }, {}))?.trustBase.networkId.id).toBe(4);
+    expect((await resolveTrustBaseOverride({}, { UNICITY_TRUST_BASE: file }))?.trustBase.networkId.id).toBe(4);
     await expect(resolveTrustBaseOverride({ network: 'devnet' }, {})).rejects.toThrow(/Unknown network 'devnet'/);
+  });
+
+  it('reports where the trust base came from, so a verdict can disclose it', async () => {
+    expect((await resolveTrustBaseOverride({ network: 'testnet2' }, {}))?.source).toEqual({
+      kind: 'bundled',
+      network: 'testnet2',
+    });
+    const file = path.join(await tempDir(), 'tb.json');
+    await writeFile(file, JSON.stringify(NETWORKS.testnet2.trustBaseJson));
+    expect((await resolveTrustBaseOverride({ trustBase: file }, {}))?.source).toEqual({
+      kind: 'file',
+      path: path.resolve(file),
+    });
   });
 });
 
@@ -132,6 +161,24 @@ describe('loadEnvironment', () => {
       expect(() => loadEnvironment()).not.toThrow();
     } finally {
       process.chdir(previous);
+    }
+  });
+
+  // `UNICITY_TRUST_BASE` is deliberately not accepted from an implicitly loaded
+  // `./.env`; see the refusal in loadEnvironment. It cannot be covered here:
+  // `process.loadEnvFile` is native and writes to the real `process.env`, while
+  // Jest hands each test file a copy, so nothing a `.env` sets is ever visible in
+  // process. That is also why the test above only asserts it does not throw. The
+  // behaviour is covered end to end in tests/e2e/CliOfflineTest.ts, which runs the
+  // built CLI as a child process.
+
+  it('leaves an inherited UNICITY_TRUST_BASE alone', () => {
+    process.env.UNICITY_TRUST_BASE = '/inherited.json';
+    try {
+      expect(loadEnvironment().refusedTrustBasePath).toBeUndefined();
+      expect(process.env.UNICITY_TRUST_BASE).toEqual('/inherited.json');
+    } finally {
+      delete process.env.UNICITY_TRUST_BASE;
     }
   });
 });

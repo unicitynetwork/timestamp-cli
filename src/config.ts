@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 
-import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/SigningService.js';
 import { HexConverter } from '@unicitylabs/state-transition-sdk/lib/util/HexConverter.js';
 
@@ -13,6 +13,7 @@ import {
   INetworkSelection,
   isNetworkName,
   ITimestampNetwork,
+  ITrustBaseChoice,
   loadTrustBase,
   NETWORK_NAMES,
   NetworkName,
@@ -56,13 +57,29 @@ export interface IStampConfig {
   readonly timeoutMs: number;
 }
 
+export interface IEnvironmentLoad {
+  /**
+   * Trust base path that an implicitly discovered `./.env` asked for, and which
+   * was refused. Present only when something was actually dropped.
+   */
+  readonly refusedTrustBasePath?: string;
+}
+
 /**
  * Load `.env` with Node's built-in loader. Variables already in the environment win; Node guarantees that.
  *
+ * `UNICITY_TRUST_BASE` is the exception: it names the root of trust, which decides
+ * what every verification means, so it is not accepted from a file that was merely
+ * found in the working directory. A token shipped next to a `.env` would otherwise
+ * verify against whatever trust base the sender chose. `--trust-base` and an
+ * explicit `--dotenv` are deliberate acts and still work.
+ *
  * @param {string} [envFile] Explicit file; when given it must exist.
+ * @returns {IEnvironmentLoad} What was refused, if anything.
  * @throws {CliError} If an explicit env file is missing.
  */
-export function loadEnvironment(envFile?: string): void {
+export function loadEnvironment(envFile?: string): IEnvironmentLoad {
+  const inheritedTrustBasePath = process.env.UNICITY_TRUST_BASE;
   try {
     process.loadEnvFile(envFile);
   } catch (error) {
@@ -73,6 +90,13 @@ export function loadEnvironment(envFile?: string): void {
       throw usageError(`Env file not found: ${envFile}`, { cause: error });
     }
   }
+
+  const loadedTrustBasePath = process.env.UNICITY_TRUST_BASE;
+  if (envFile === undefined && inheritedTrustBasePath === undefined && loadedTrustBasePath !== undefined) {
+    delete process.env.UNICITY_TRUST_BASE;
+    return { refusedTrustBasePath: loadedTrustBasePath };
+  }
+  return {};
 }
 
 function parseHex32(input: string, message: string): Uint8Array {
@@ -177,26 +201,50 @@ export function resolveNetworkSelection(flags: INetworkFlags, env: NodeJS.Proces
  * `UNICITY_NETWORK` is not consulted; it configures stamping, and a token says
  * which network it belongs to.
  *
+ * The provenance travels with the trust base so the verdict can say which root of
+ * trust produced it. An override that looked like the bundled pin would make a
+ * forged token indistinguishable from a genuine one.
+ *
  * @param {INetworkFlags} flags Command-line flags.
  * @param {NodeJS.ProcessEnv} env Environment.
- * @returns {Promise<RootTrustBase|undefined>} The override, or undefined to derive it from the token.
+ * @returns {Promise<ITrustBaseChoice|undefined>} The override, or undefined to derive it from the token.
  * @throws {CliError} On an unknown network name.
  */
 export async function resolveTrustBaseOverride(
   flags: INetworkFlags,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<RootTrustBase | undefined> {
+): Promise<ITrustBaseChoice | undefined> {
   const trustBasePath = flags.trustBase ?? env.UNICITY_TRUST_BASE;
   if (trustBasePath !== undefined) {
-    return await loadTrustBase(trustBasePath);
+    return {
+      source: { kind: 'file', path: path.resolve(trustBasePath) },
+      trustBase: await loadTrustBase(trustBasePath),
+    };
   }
-  return flags.network === undefined ? undefined : bundledTrustBase(parseNetworkName(flags.network));
+  if (flags.network === undefined) {
+    return undefined;
+  }
+  const network = parseNetworkName(flags.network);
+  return { source: { kind: 'bundled', network }, trustBase: bundledTrustBase(network) };
 }
+
+/**
+ * Node timers hold the delay in a *signed* 32-bit integer, so 2147483647 ms is the
+ * longest wait that can be represented. A larger delay is not refused: it is
+ * silently reduced to 1 ms, with only a `TimeoutOverflowWarning` to show for it.
+ *
+ * That matters here because the signal is constructed after the certification
+ * request has been submitted and billed. A value just over the limit would
+ * therefore certify the digest and then abandon the proof wait immediately —
+ * losing the paid stamp, which is the very thing this bound exists to prevent.
+ * Enforcing it at parse time keeps the failure before the network call.
+ */
+const MAX_TIMEOUT_SECONDS = 2_147_483;
 
 /**
  * @param {string} [value] Flag or environment value.
  * @returns {number} Timeout in milliseconds.
- * @throws {CliError} If the value is not a positive integer.
+ * @throws {CliError} If the value is not a positive integer, or is too large to wait for.
  */
 export function parseTimeoutSeconds(value?: string): number {
   if (value === undefined) {
@@ -205,6 +253,9 @@ export function parseTimeoutSeconds(value?: string): number {
   const seconds = Number(value);
   if (!Number.isInteger(seconds) || seconds <= 0) {
     throw usageError(`--timeout must be a positive integer number of seconds, got '${value}'.`);
+  }
+  if (seconds > MAX_TIMEOUT_SECONDS) {
+    throw usageError(`--timeout must be at most ${MAX_TIMEOUT_SECONDS} seconds, got '${value}'.`);
   }
   return seconds * 1000;
 }
