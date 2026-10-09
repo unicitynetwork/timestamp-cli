@@ -1,4 +1,4 @@
-import { chmod, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { runCli } from '../support/cli.js';
@@ -132,21 +132,30 @@ describe('unicity-timestamp (offline)', () => {
   );
 
   it(
-    'restores mode 0600 when --force overwrites a key file with looser permissions',
+    'writes a forced key to a new 0600 inode rather than into the old one',
     async () => {
-      // `writeFile`'s mode applies only when the file is created, so the forced
-      // overwrite path has to narrow the permissions itself or leave a private
-      // key readable by everyone while reporting 0600.
+      // `writeFile`'s mode applies only when a file is created, so overwriting in
+      // place would fill the existing inode while it still carried the old
+      // permissions. Narrowing it afterwards is not enough: a reader that opened
+      // the file first keeps its descriptor across the change. The forced path has
+      // to land on a different inode, which is what this asserts.
       const keyFile = path.join(cwd, 'loose.key');
       await writeFile(keyFile, 'placeholder\n', { mode: 0o600 });
       await chmod(keyFile, 0o644);
-      expect((await stat(keyFile)).mode & 0o777).toBe(0o644);
+      const before = await stat(keyFile);
+      expect(before.mode & 0o777).toBe(0o644);
 
       const forced = await runCli(['keygen', '--out', keyFile, '--force'], { cwd });
       expect(forced.code).toBe(0);
       expect(forced.stdout).toContain('mode 0600');
-      expect((await stat(keyFile)).mode & 0o777).toBe(0o600);
+
+      const after = await stat(keyFile);
+      expect(after.mode & 0o777).toBe(0o600);
+      expect(after.ino).not.toEqual(before.ino);
       expect((await readFile(keyFile, 'utf8')).trim()).toMatch(/^[0-9a-f]{64}$/);
+
+      // No staging file left in the directory.
+      expect((await readdir(cwd)).filter((name) => name.startsWith('.loose.key.'))).toEqual([]);
     },
     TIMEOUT,
   );

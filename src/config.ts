@@ -229,13 +229,17 @@ export async function resolveTrustBaseOverride(
 }
 
 /**
- * `AbortSignal.timeout` rejects a delay above the unsigned 32-bit millisecond
- * range, and it is constructed after the certification request has been submitted
- * and billed — so an unbounded value here would throw away a stamp that had
- * already been paid for. Rejecting at parse time keeps the failure before the
- * network call.
+ * Node timers hold the delay in a *signed* 32-bit integer, so 2147483647 ms is the
+ * longest wait that can be represented. A larger delay is not refused: it is
+ * silently reduced to 1 ms, with only a `TimeoutOverflowWarning` to show for it.
+ *
+ * That matters here because the signal is constructed after the certification
+ * request has been submitted and billed. A value just over the limit would
+ * therefore certify the digest and then abandon the proof wait immediately —
+ * losing the paid stamp, which is the very thing this bound exists to prevent.
+ * Enforcing it at parse time keeps the failure before the network call.
  */
-const MAX_TIMEOUT_SECONDS = 4_294_967;
+const MAX_TIMEOUT_SECONDS = 2_147_483;
 
 /**
  * @param {string} [value] Flag or environment value.

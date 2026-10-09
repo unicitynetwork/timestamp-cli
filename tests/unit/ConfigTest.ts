@@ -63,15 +63,19 @@ describe('parseTimeoutSeconds', () => {
   });
 
   // AbortSignal.timeout is constructed after the certification request has been
-  // submitted and billed, so a delay it refuses would throw away a paid stamp.
-  // These have to fail here, before the network call.
-  it.each(['4294968', '99999999', '1000000000'])('rejects %p as too large to wait for', (input) => {
-    expect(() => parseTimeoutSeconds(input)).toThrow(/at most 4294967 seconds/);
+  // submitted and billed, so a delay Node cannot represent would certify the
+  // digest and then abandon the wait. These have to fail before the network call.
+  it.each(['2147484', '4294967', '99999999', '1000000000'])('rejects %p as too large to wait for', (input) => {
+    expect(() => parseTimeoutSeconds(input)).toThrow(/at most 2147483 seconds/);
   });
 
-  it('accepts the largest delay AbortSignal.timeout will take', () => {
-    expect(parseTimeoutSeconds('4294967')).toBe(4_294_967_000);
-    expect(() => AbortSignal.timeout(parseTimeoutSeconds('4294967'))).not.toThrow();
+  it('keeps the largest accepted delay inside the range a Node timer can hold', () => {
+    // Beyond this a timer is silently reduced to 1ms rather than refused, so the
+    // bound has to be asserted numerically; nothing throws to catch it.
+    const NODE_TIMEOUT_MAX_MS = 2 ** 31 - 1;
+    expect(parseTimeoutSeconds('2147483')).toBe(2_147_483_000);
+    expect(parseTimeoutSeconds('2147483')).toBeLessThanOrEqual(NODE_TIMEOUT_MAX_MS);
+    expect(parseTimeoutSeconds(undefined)).toBeLessThanOrEqual(NODE_TIMEOUT_MAX_MS);
   });
 });
 
